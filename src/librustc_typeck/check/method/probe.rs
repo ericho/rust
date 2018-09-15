@@ -49,7 +49,7 @@ struct ProbeContext<'a, 'gcx: 'a + 'tcx, 'tcx: 'a> {
     mode: Mode,
     method_name: Option<ast::Ident>,
     return_type: Option<Ty<'tcx>>,
-    steps: Rc<Vec<CandidateStep<'tcx>>>,
+    steps: Rc<Vec<CandidateStep<'gcx, 'tcx>>>,
     inherent_candidates: Vec<Candidate<'tcx>>,
     extension_candidates: Vec<Candidate<'tcx>>,
     impl_dups: FxHashSet<DefId>,
@@ -80,8 +80,8 @@ impl<'a, 'gcx, 'tcx> Deref for ProbeContext<'a, 'gcx, 'tcx> {
 }
 
 #[derive(Debug)]
-struct CandidateStep<'tcx> {
-    self_ty: Ty<'tcx>,
+struct CandidateStep<'gcx: 'tcx, 'tcx> {
+    self_ty: Canonical<'gcx, QueryResult<'gcx, Ty<'gcx>>>,
     autoderefs: usize,
     // true if the type results from a dereference of a raw pointer.
     // when assembling candidates, we include these steps, but not when
@@ -247,31 +247,34 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                       -> Result<R, MethodError<'tcx>>
         where OP: FnOnce(ProbeContext<'a, 'gcx, 'tcx>) -> Result<R, MethodError<'tcx>>
     {
-        // FIXME(#18741) -- right now, creating the steps involves evaluating the
-        // `*` operator, which registers obligations that then escape into
-        // the global fulfillment context and thus has global
-        // side-effects. This is a bit of a pain to refactor. So just let
-        // it ride, although it's really not great, and in fact could I
-        // think cause spurious errors. Really though this part should
-        // take place in the `self.probe` below.
+        let mut orig_values = SmallVec::new();
+        let self_ty = self.infcx.canonicalize_data(&self_ty, &mut orig_values);
         let steps = if mode == Mode::MethodCall {
-            match self.create_steps(span, scope_expr_id, self_ty, is_suggestion) {
-                Some(steps) => steps,
-                None => {
-                    return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
-                                                                     Vec::new(),
-                                                                     Vec::new(),
-                                                                     None,
-                                                                     mode)))
+            tcx.infer_ctxt().enter(|ref infcx| {
+                match create_steps(infcx, span, scope_expr_id, self_ty, is_suggestion) {
+                    Some(steps) => Ok(steps),
+                    None => {
+                        return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
+                                                                         Vec::new(),
+                                                                         Vec::new(),
+                                                                         None,
+                                                                         mode)))
+                    }
                 }
-            }
+            })?;
         } else {
             vec![CandidateStep {
-                     self_ty,
-                     autoderefs: 0,
-                     from_unsafe_deref: false,
-                     unsize: false,
-                 }]
+                self_ty,
+                autoderefs: 0,
+                from_unsafe_deref: false,
+                unsize: false,
+            }];
+        }
+
+        let steps =
+
+        } else {
+
         };
 
         debug!("ProbeContext: steps for self_ty={:?} are {:?}",
@@ -295,19 +298,20 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             op(probe_cx)
         })
     }
+}
 
-    fn create_steps(&self,
-                    span: Span,
-                    scope_expr_id: ast::NodeId,
-                    self_ty: Ty<'tcx>,
-                    is_suggestion: IsSuggestion)
-                    -> Option<Vec<CandidateStep<'tcx>>> {
-        // FIXME: we don't need to create the entire steps in one pass
+fn create_steps(&self,
+                span: Span,
+                scope_expr_id: ast::NodeId,
+                self_ty: Ty<'tcx>,
+                is_suggestion: IsSuggestion)
+                -> Option<Vec<CandidateStep<'tcx>>> {
+    // FIXME: we don't need to create the entire steps in one pass
 
-        let mut autoderef = self.autoderef(span, self_ty).include_raw_pointers();
-        let mut reached_raw_pointer = false;
-        let mut steps: Vec<_> = autoderef.by_ref()
-            .map(|(ty, d)| {
+    let mut autoderef = self.autoderef(span, self_ty).include_raw_pointers();
+    let mut reached_raw_pointer = false;
+    let mut steps: Vec<_> = autoderef.by_ref()
+        .map(|(ty, d)| {
                 let step = CandidateStep {
                     self_ty: ty,
                     autoderefs: d,
@@ -376,7 +380,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
         Some(steps)
     }
-}
+
 
 impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
     fn new(fcx: &'a FnCtxt<'a, 'gcx, 'tcx>,
