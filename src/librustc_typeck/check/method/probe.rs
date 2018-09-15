@@ -249,33 +249,61 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     {
         let mut orig_values = SmallVec::new();
         let self_ty = self.infcx.canonicalize_data(&self_ty, &mut orig_values);
+        // XXX: consider caching this "whole op" here.
         let steps = if mode == Mode::MethodCall {
             tcx.infer_ctxt().enter(|ref infcx| {
-                match create_steps(infcx, span, scope_expr_id, self_ty, is_suggestion) {
-                    Some(steps) => Ok(steps),
-                    None => {
-                        return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
-                                                                         Vec::new(),
-                                                                         Vec::new(),
-                                                                         None,
-                                                                         mode)))
-                    }
+                create_steps_inner(infcx, orig_values, self.param_env, span, self_ty)
+            })
+        } else {
+            // XXX: don't make an inference context for nothing here
+            tcx.infer_ctxt().enter(|ref infcx| {
+                CreateStepsResult {
+                    steps: vec![CandidateStep {
+                        self_ty: do_make_query_result(infcx, orig_values, self_ty),
+                        autoderefs: 0,
+                        from_unsafe_deref: false,
+                        unsize: false,
+                    }],
+                    bad_ty: None
                 }
-            })?;
-        } else {
-            vec![CandidateStep {
-                self_ty,
-                autoderefs: 0,
-                from_unsafe_deref: false,
-                unsize: false,
-            }];
-        }
-
-        let steps =
-
-        } else {
-
+            })
         };
+
+        if let Some(CreateStepsBadTy { reached_raw_pointer, ty }) = steps.bad_ty {
+            // Ended in an inference variable. If we are doing
+            // a real method lookup, this is a hard error because it's
+            // possible that there will be multiple applicable methods.
+            if !is_suggestion.0
+                && reached_raw_pointer
+                && !self.tcx.features().arbitrary_self_types
+            {
+                // this case used to be allowed by the compiler,
+                // so we do a future-compat lint here for the 2015 edition
+                // (see https://github.com/rust-lang/rust/issues/46906)
+                if self.tcx.sess.rust_2018() {
+                    span_err!(self.tcx.sess, span, E0699,
+                              "the type of this value must be known \
+                               to call a method on a raw pointer on it");
+                } else {
+                   self.tcx.lint_node(
+                        lint::builtin::TYVAR_BEHIND_RAW_POINTER,
+                        scope_expr_id,
+                        span,
+                        "type annotations needed");
+                }
+            } else {
+                let ty = self.instantiate_query_result(&orig_values, &ty)
+                    .unwrap_or_else(|| span_bug!(span, "instantiating {:?} failed?", ty));
+                let t = self.structurally_resolved_type(span, final_ty);
+                assert_eq!(t, self.tcx.types.err);
+                return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
+                                                                 Vec::new(),
+                                                                 Vec::new(),
+                                                                 None,
+                                                                 mode)));
+
+            }
+        }
 
         debug!("ProbeContext: steps for self_ty={:?} are {:?}",
                self_ty,
@@ -300,86 +328,103 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     }
 }
 
-fn create_steps(&self,
-                span: Span,
-                scope_expr_id: ast::NodeId,
-                self_ty: Ty<'tcx>,
-                is_suggestion: IsSuggestion)
-                -> Option<Vec<CandidateStep<'tcx>>> {
-    // FIXME: we don't need to create the entire steps in one pass
 
-    let mut autoderef = self.autoderef(span, self_ty).include_raw_pointers();
+fn do_instantiate_query_result<'a, 'gcx, 'tcx>(fcx: &'a FnCtxt<'a, 'gcx, 'tcx>,
+                                               param_env: ty::ParamEnv<'tcx>,
+                                               inference_vars: CanonicalVarValues<'tcx>,
+                                               ty: Ty<'gcx>)
+                                               -> Canonical<'gcx, QueryResult<'gcx, Ty<'gcx>>>
+{
+    infcx.canonicalize_response(&QueryResult {
+        var_values: inference_vars,
+        region_constraints: vec![],
+        certainty: Certainity::Proven, // This field is not used by typeck
+        value: ty,
+    })
+}
+}
+
+#[derive(Debug)]
+struct CreateStepsResult<'gcx> {
+    steps: Vec<CandidateStep<'gcx>>,
+    opt_bad_ty: Option<CreateStepsBadTy<'gcx>>
+}
+
+#[derive(Debug)]
+struct CreateStepsBadTy<'gcx> {
+    reached_raw_pointer: bool,
+    ty: Canonical<'gcx, QueryResult<'gcx, Ty<'gcx>>>,
+}
+
+fn do_make_query_result<'a, 'gcx, 'tcx>(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+                                        inference_vars: CanonicalVarValues<'tcx>,
+                                        ty: Ty<'gcx>)
+                                        -> Canonical<'gcx, QueryResult<'gcx, Ty<'gcx>>>
+{
+    infcx.canonicalize_response(&QueryResult {
+        var_values: inference_vars,
+        region_constraints: vec![],
+        certainty: Certainity::Proven, // This field is not used by typeck
+        value: ty,
+    })
+}
+
+fn create_steps_inner<'a, 'gcx, 'tcx>(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+                                      inference_vars: CanonicalVarValues<'tcx>,
+                                      param_env: ty::ParamEnv<'tcx>,
+                                      span: Span,
+                                      self_ty: Canonical<'gcx, Ty<'gcx>>)
+                                      -> CreateStepsResult<'gcx>
+{
+    let mut autoderef = Autoderef::new(infcx, param_env, DUMMY_NODE_ID, span, self_ty)
+        .include_raw_pointers();
     let mut reached_raw_pointer = false;
     let mut steps: Vec<_> = autoderef.by_ref()
         .map(|(ty, d)| {
-                let step = CandidateStep {
-                    self_ty: ty,
-                    autoderefs: d,
-                    from_unsafe_deref: reached_raw_pointer,
-                    unsize: false,
-                };
-                if let ty::RawPtr(_) = ty.sty {
-                    // all the subsequent steps will be from_unsafe_deref
-                    reached_raw_pointer = true;
-                }
-                step
+            let step = CandidateStep {
+                self_ty: do_make_query_result(infcx, inference_vars, infcx.tcx.mk_slice(ty)),
+                autoderefs: d,
+                from_unsafe_deref: reached_raw_pointer,
+                unsize: false,
+            };
+            if let ty::RawPtr(_) = ty.sty {
+                // all the subsequent steps will be from_unsafe_deref
+                reached_raw_pointer = true;
+            }
+            step
+        })
+        .collect();
+
+    let final_ty = autoderef.maybe_ambiguous_final_ty();
+    let opt_bad_ty = match final_ty.sty {
+        ty::Infer(ty::TyVar(_)) |
+        ty::Error => {
+            Some(CreateStepsBadTy {
+                reached_raw_pointer,
+                ty: final_ty
             })
-            .collect();
-
-        let final_ty = autoderef.maybe_ambiguous_final_ty();
-        match final_ty.sty {
-            ty::Infer(ty::TyVar(_)) => {
-                // Ended in an inference variable. If we are doing
-                // a real method lookup, this is a hard error because it's
-                // possible that there will be multiple applicable methods.
-                if !is_suggestion.0 {
-                    if reached_raw_pointer
-                    && !self.tcx.features().arbitrary_self_types {
-                        // this case used to be allowed by the compiler,
-                        // so we do a future-compat lint here for the 2015 edition
-                        // (see https://github.com/rust-lang/rust/issues/46906)
-                        if self.tcx.sess.rust_2018() {
-                          span_err!(self.tcx.sess, span, E0699,
-                                    "the type of this value must be known \
-                                     to call a method on a raw pointer on it");
-                        } else {
-                            self.tcx.lint_node(
-                                lint::builtin::TYVAR_BEHIND_RAW_POINTER,
-                                scope_expr_id,
-                                span,
-                                "type annotations needed");
-                        }
-                    } else {
-                        let t = self.structurally_resolved_type(span, final_ty);
-                        assert_eq!(t, self.tcx.types.err);
-                        return None
-                    }
-                } else {
-                    // If we're just looking for suggestions,
-                    // though, ambiguity is no big thing, we can
-                    // just ignore it.
-                }
-            }
-            ty::Array(elem_ty, _) => {
-                let dereferences = steps.len() - 1;
-
-                steps.push(CandidateStep {
-                    self_ty: self.tcx.mk_slice(elem_ty),
-                    autoderefs: dereferences,
-                    // this could be from an unsafe deref if we had
-                    // a *mut/const [T; N]
-                    from_unsafe_deref: reached_raw_pointer,
-                    unsize: true,
-                });
-            }
-            ty::Error => return None,
-            _ => (),
         }
+        ty::Array(elem_ty, _) => {
+            let dereferences = steps.len() - 1;
 
-        debug!("create_steps: steps={:?}", steps);
+            steps.push(CandidateStep {
+                self_ty: do_make_query_result(infcx, inference_vars, infcx.tcx.mk_slice(elem_ty)),
+                autoderefs: dereferences,
+                // this could be from an unsafe deref if we had
+                // a *mut/const [T; N]
+                from_unsafe_deref: reached_raw_pointer,
+                unsize: true,
+            });
 
-        Some(steps)
+            None
+        }
+        _ => None
     }
+
+    debug!("create_steps: steps={:?} error={:?}", steps, error);
+
+    CreateStepsResult { steps, bad_ty }
+}
 
 
 impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
