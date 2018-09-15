@@ -107,8 +107,7 @@ impl<'a, 'gcx, 'tcx> Iterator for Autoderef<'a, 'gcx, 'tcx> {
 }
 
 impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
-    pub fn new(&'a self,
-               infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+    pub fn new(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
                param_env: ty::ParamEnv<'tcx>,
                body_id: ast::NodeId,
                span: Span,
@@ -120,7 +119,7 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
             body_id,
             param_env,
             steps: vec![],
-            cur_ty: self.resolve_type_vars_if_possible(&base_ty),
+            cur_ty: infcx.resolve_type_vars_if_possible(&base_ty),
             obligations: vec![],
             at_start: true,
             include_raw_pointers: false,

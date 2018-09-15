@@ -20,3 +20,4 @@ rustc_target = { path = "../librustc_target" }
 smallvec = { version = "0.6.5", features = ["union"] }
 syntax = { path = "../libsyntax" }
 syntax_pos = { path = "../libsyntax_pos" }
+smallvec = { version = "0.6.5", features = ["union"] }
