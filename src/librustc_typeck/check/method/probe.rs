@@ -278,14 +278,13 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             })
         };
 
+        // If we encountered an `_` type or an error type during autoderef, this is
+        // ambiguous.
         if let Some(CreateStepsBadTy { reached_raw_pointer, ty }) = &steps.opt_bad_ty {
-            // Ended in an inference variable. If we are doing
-            // a real method lookup, this is a hard error because it's
-            // possible that there will be multiple applicable methods.
-            if !is_suggestion.0
-                && *reached_raw_pointer
-                && !self.tcx.features().arbitrary_self_types
-            {
+            if is_suggestion.0 {
+                // Ambiguity was encountered during a suggestion. Just keep going.
+                debug!("ProbeContext: encountered ambiguity in suggestion");
+            } else if *reached_raw_pointer && !self.tcx.features().arbitrary_self_types {
                 // this case used to be allowed by the compiler,
                 // so we do a future-compat lint here for the 2015 edition
                 // (see https://github.com/rust-lang/rust/issues/46906)
@@ -301,6 +300,9 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                         "type annotations needed");
                 }
             } else {
+                // Encountered a real ambiguity, so abort the lookup. If `ty` is not
+                // an `Err`, report the right "type annotations needed" error pointing
+                // to it.
                 let ty = do_instantiate_query_result(self, span, &orig_values, ty)
                     .unwrap_or_else(|_| span_bug!(span, "instantiating {:?} failed?", ty));
                 let t = self.structurally_resolved_type(span, ty.value);
@@ -310,7 +312,6 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                                                  Vec::new(),
                                                                  None,
                                                                  mode)));
-
             }
         }
 
@@ -392,7 +393,7 @@ fn create_steps_inner<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
         let mut steps: Vec<_> = autoderef.by_ref()
             .map(|(ty, d)| {
                 let step = CandidateStep {
-                    self_ty: do_make_query_result(infcx, &inference_vars, infcx.tcx.mk_slice(ty)),
+                    self_ty: do_make_query_result(infcx, &inference_vars, ty),
                     autoderefs: d,
                     from_unsafe_deref: reached_raw_pointer,
                     unsize: false,
