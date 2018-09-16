@@ -258,14 +258,15 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         let param_env_and_self_ty =
             self.infcx.canonicalize_query(&(self.param_env, self_ty), &mut orig_values);
 
-        // XXX: consider caching this "whole op" here.
+        // FIXME: consider caching this "whole op" here.
         let steps = if mode == Mode::MethodCall {
             create_steps_inner(self.tcx.global_tcx(), span, param_env_and_self_ty)
         } else {
-            // XXX: don't make an inference context for nothing here
+            // FIXME: don't make an inference context for nothing here
             self.tcx.global_tcx().infer_ctxt().enter(|ref infcx| {
                 let ((_, self_ty), canonical_inference_vars) =
-                    infcx.instantiate_canonical_with_fresh_inference_vars(span, &param_env_and_self_ty);
+                    infcx.instantiate_canonical_with_fresh_inference_vars(
+                        span, &param_env_and_self_ty);
                 CreateStepsResult {
                     steps: vec![CandidateStep {
                         self_ty: do_make_query_result(infcx, &canonical_inference_vars, self_ty),
@@ -324,7 +325,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // that we create during the probe process are removed later
         self.probe(|_| {
             let mut probe_cx = ProbeContext::new(
-                self, span, mode, method_name, return_type, orig_values, Rc::new(steps.steps), is_suggestion,
+                self, span, mode, method_name, return_type, orig_values,
+                Rc::new(steps.steps), is_suggestion,
             );
 
             probe_cx.assemble_inherent_candidates();
@@ -419,7 +421,8 @@ fn create_steps_inner<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
                 let dereferences = steps.len() - 1;
 
                 steps.push(CandidateStep {
-                    self_ty: do_make_query_result(infcx, &inference_vars, infcx.tcx.mk_slice(elem_ty)),
+                    self_ty: do_make_query_result(infcx, &inference_vars,
+                                                  infcx.tcx.mk_slice(elem_ty)),
                     autoderefs: dereferences,
                     // this could be from an unsafe deref if we had
                     // a *mut/const [T; N]
@@ -516,8 +519,9 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
             ty::Dynamic(ref data, ..) => {
                 if let Some(p) = data.principal() {
                     self.fcx.probe(|_| {
-                        let InferOk { value: self_ty, obligations: _ } = do_instantiate_query_result(
-                            self.fcx, self.span, &self.orig_values, self_ty)
+                        let InferOk { value: self_ty, obligations: _ } =
+                            do_instantiate_query_result(self.fcx, self.span,
+                                                        &self.orig_values, self_ty)
                             .unwrap_or_else(|_| {
                                 span_bug!(self.span, "{:?} was applicable but now isn't?", self_ty)
                             });
@@ -693,7 +697,8 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
                 if let Some(p) = data.principal() {
                     p
                 } else {
-                    span_bug!(self.span, "bad object {:?} in assemble_inherent_candidates_from_object",
+                    span_bug!(self.span,
+                              "bad object {:?} in assemble_inherent_candidates_from_object",
                               self_ty);
                 }
             },
@@ -1017,7 +1022,10 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
         })
     }
 
-    fn pick_autorefd_method(&mut self, step: &CandidateStep<'gcx>, self_ty: Ty<'tcx>, mutbl: hir::Mutability)
+    fn pick_autorefd_method(&mut self,
+                            step: &CandidateStep<'gcx>,
+                            self_ty: Ty<'tcx>,
+                            mutbl: hir::Mutability)
                             -> Option<PickResult<'tcx>> {
         let tcx = self.tcx;
 
