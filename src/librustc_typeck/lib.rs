@@ -90,12 +90,13 @@ This API is completely unstable and subject to change.
 extern crate syntax_pos;
 
 extern crate arena;
+extern crate smallvec;
+
 #[macro_use] extern crate rustc;
 extern crate rustc_platform_intrinsics as intrinsics;
 extern crate rustc_data_structures;
 extern crate rustc_errors as errors;
 extern crate rustc_target;
-extern crate smallvec;
 
 use rustc::hir;
 use rustc::lint;

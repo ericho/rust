@@ -8,20 +8,18 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use astconv::AstConv;
-
 use super::{FnCtxt, PlaceOp, Needs};
 use super::method::MethodCallee;
 
-use rustc::infer::InferOk;
+use rustc::infer::{InferCtxt, InferOk};
 use rustc::session::DiagnosticMessageId;
-use rustc::traits;
+use rustc::traits::{self, TraitEngine};
 use rustc::ty::{self, Ty, TraitRef};
 use rustc::ty::{ToPredicate, TypeFoldable};
 use rustc::ty::adjustment::{Adjustment, Adjust, OverloadedDeref};
 
 use syntax_pos::Span;
-use syntax::ast::Ident;
+use syntax::ast::{self, Ident};
 
 use std::iter;
 
@@ -32,7 +30,9 @@ enum AutoderefKind {
 }
 
 pub struct Autoderef<'a, 'gcx: 'tcx, 'tcx: 'a> {
-    fcx: &'a FnCtxt<'a, 'gcx, 'tcx>,
+    infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+    body_id: ast::NodeId,
+    param_env: ty::ParamEnv<'tcx>,
     steps: Vec<(Ty<'tcx>, AutoderefKind)>,
     cur_ty: Ty<'tcx>,
     obligations: Vec<traits::PredicateObligation<'tcx>>,
@@ -45,7 +45,7 @@ impl<'a, 'gcx, 'tcx> Iterator for Autoderef<'a, 'gcx, 'tcx> {
     type Item = (Ty<'tcx>, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let tcx = self.fcx.tcx;
+        let tcx = self.infcx.tcx;
 
         debug!("autoderef: steps={:?}, cur_ty={:?}",
                self.steps,
@@ -107,10 +107,30 @@ impl<'a, 'gcx, 'tcx> Iterator for Autoderef<'a, 'gcx, 'tcx> {
 }
 
 impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
+    pub fn new(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+               param_env: ty::ParamEnv<'tcx>,
+               body_id: ast::NodeId,
+               span: Span,
+               base_ty: Ty<'tcx>)
+               -> Autoderef<'a, 'gcx, 'tcx>
+    {
+        Autoderef {
+            infcx,
+            body_id,
+            param_env,
+            steps: vec![],
+            cur_ty: infcx.resolve_type_vars_if_possible(&base_ty),
+            obligations: vec![],
+            at_start: true,
+            include_raw_pointers: false,
+            span,
+        }
+    }
+
     fn overloaded_deref_ty(&mut self, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
         debug!("overloaded_deref_ty({:?})", ty);
 
-        let tcx = self.fcx.tcx();
+        let tcx = self.infcx.tcx;
 
         // <cur_ty as Deref>
         let trait_ref = TraitRef {
@@ -118,43 +138,52 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
             substs: tcx.mk_substs_trait(self.cur_ty, &[]),
         };
 
-        let cause = traits::ObligationCause::misc(self.span, self.fcx.body_id);
+        let cause = traits::ObligationCause::misc(self.span, self.body_id);
 
         let obligation = traits::Obligation::new(cause.clone(),
-                                                 self.fcx.param_env,
+                                                 self.param_env,
                                                  trait_ref.to_predicate());
-        if !self.fcx.predicate_may_hold(&obligation) {
+        if !self.infcx.predicate_may_hold(&obligation) {
             debug!("overloaded_deref_ty: cannot match obligation");
             return None;
         }
 
-        let mut selcx = traits::SelectionContext::new(self.fcx);
-        let normalized_ty = traits::normalize_projection_type(&mut selcx,
-                                                              self.fcx.param_env,
-                                                              ty::ProjectionTy::from_ref_and_name(
-                                                                  tcx,
-                                                                  trait_ref,
-                                                                  Ident::from_str("Target"),
-                                                              ),
-                                                              cause,
-                                                              0,
-                                                              &mut self.obligations);
+        let mut fulfillcx = traits::FulfillmentContext::new_in_snapshot();
+        let normalized_ty = fulfillcx.normalize_projection_type(
+            &self.infcx,
+            self.param_env,
+            ty::ProjectionTy::from_ref_and_name(
+                tcx,
+                trait_ref,
+                Ident::from_str("Target"),
+            ),
+            cause);
+        if let Err(e) = fulfillcx.select_where_possible(&self.infcx) {
+            // This shouldn't happen, except for evaluate/fulfill mismatches,
+            // but that's not a reason for an ICE (`predicate_may_hold` is conservative
+            // by design).
+            debug!("overloaded_deref_ty: encountered errors {:?} while fulfilling",
+                   e);
+            return None;
+        }
+        let obligations = fulfillcx.pending_obligations();
+        debug!("overloaded_deref_ty({:?}) = ({:?}, {:?})",
+               ty, normalized_ty, obligations);
+        self.obligations.extend(obligations);
 
-        debug!("overloaded_deref_ty({:?}) = {:?}", ty, normalized_ty);
-
-        Some(self.fcx.resolve_type_vars_if_possible(&normalized_ty))
+        Some(self.infcx.resolve_type_vars_if_possible(&normalized_ty))
     }
 
     /// Returns the final type, generating an error if it is an
     /// unresolved inference variable.
-    pub fn unambiguous_final_ty(&self) -> Ty<'tcx> {
-        self.fcx.structurally_resolved_type(self.span, self.cur_ty)
+    pub fn unambiguous_final_ty(&self, fcx: &FnCtxt<'a, 'gcx, 'tcx>) -> Ty<'tcx> {
+        fcx.structurally_resolved_type(self.span, self.cur_ty)
     }
 
     /// Returns the final type we ended up with, which may well be an
     /// inference variable (we will resolve it first, if possible).
     pub fn maybe_ambiguous_final_ty(&self) -> Ty<'tcx> {
-        self.fcx.resolve_type_vars_if_possible(&self.cur_ty)
+        self.infcx.resolve_type_vars_if_possible(&self.cur_ty)
     }
 
     pub fn step_count(&self) -> usize {
@@ -162,19 +191,19 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
     }
 
     /// Returns the adjustment steps.
-    pub fn adjust_steps(&self, needs: Needs)
+    pub fn adjust_steps(&self, fcx: &FnCtxt<'a, 'gcx, 'tcx>, needs: Needs)
                         -> Vec<Adjustment<'tcx>> {
-        self.fcx.register_infer_ok_obligations(self.adjust_steps_as_infer_ok(needs))
+        fcx.register_infer_ok_obligations(self.adjust_steps_as_infer_ok(fcx, needs))
     }
 
-    pub fn adjust_steps_as_infer_ok(&self, needs: Needs)
+    pub fn adjust_steps_as_infer_ok(&self, fcx: &FnCtxt<'a, 'gcx, 'tcx>, needs: Needs)
                                     -> InferOk<'tcx, Vec<Adjustment<'tcx>>> {
         let mut obligations = vec![];
         let targets = self.steps.iter().skip(1).map(|&(ty, _)| ty)
             .chain(iter::once(self.cur_ty));
         let steps: Vec<_> = self.steps.iter().map(|&(source, kind)| {
             if let AutoderefKind::Overloaded = kind {
-                self.fcx.try_overloaded_deref(self.span, source, needs)
+                fcx.try_overloaded_deref(self.span, source, needs)
                     .and_then(|InferOk { value: method, obligations: o }| {
                         obligations.extend(o);
                         if let ty::Ref(region, _, mutbl) = method.sig.output().sty {
@@ -211,8 +240,7 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
         self
     }
 
-    pub fn finalize(self) {
-        let fcx = self.fcx;
+    pub fn finalize(self, fcx: &FnCtxt<'a, 'gcx, 'tcx>) {
         fcx.register_predicates(self.into_obligations());
     }
 
@@ -223,15 +251,7 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     pub fn autoderef(&'a self, span: Span, base_ty: Ty<'tcx>) -> Autoderef<'a, 'gcx, 'tcx> {
-        Autoderef {
-            fcx: self,
-            steps: vec![],
-            cur_ty: self.resolve_type_vars_if_possible(&base_ty),
-            obligations: vec![],
-            at_start: true,
-            include_raw_pointers: false,
-            span,
-        }
+        Autoderef::new(self, self.param_env, self.body_id, span, base_ty)
     }
 
     pub fn try_overloaded_deref(&self,
